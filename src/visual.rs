@@ -56,6 +56,7 @@ impl Signal {
 pub struct Visual {
     pub mode: ViewMode,
     pub span: f64,
+    pub delay: f64,
     pub bands: usize,
     pub position: usize,
     signal: Option<Signal>,
@@ -66,6 +67,7 @@ impl Visual {
         Self {
             mode: ViewMode::Combined,
             span: 96.0,
+            delay: 0.0,
             bands: 128,
             position: 0,
             signal: None,
@@ -169,8 +171,9 @@ impl Render for Visual {
             [color.r, color.g, color.b].map(|channel| (channel * 255.0).round() as u8)
         });
         let track = signal.track.clone();
-        let position = self.position;
         let samples = (f64::from(track.sample_rate) * self.span / 1000.0).max(2.0);
+        let position = (self.position as f64 - f64::from(track.sample_rate) * self.delay / 1000.0)
+            .clamp(-samples, track.frames() as f64 + samples);
         let spectrum = cx.entity();
         let panel = || {
             div()
@@ -251,7 +254,7 @@ impl Render for Visual {
 }
 
 fn viewport(
-    position: usize,
+    position: f64,
     samples: f64,
     bounds: Bounds<Pixels>,
     window: &Window,
@@ -271,7 +274,7 @@ fn viewport(
 }
 
 fn playhead(view: Viewport, bounds: Bounds<Pixels>, ink: Hsla, window: &mut Window) {
-    let x = (view.position as f64 - view.start()) / view.samples;
+    let x = (view.position - view.start()) / view.samples;
     window.paint_quad(fill(
         Bounds::new(
             point(bounds.left() + bounds.size.width * x as f32, bounds.top()),

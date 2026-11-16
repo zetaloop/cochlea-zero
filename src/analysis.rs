@@ -6,7 +6,7 @@ use crate::audio::Track;
 
 #[derive(Clone, Copy)]
 pub struct Viewport {
-    pub position: usize,
+    pub position: f64,
     pub samples: f64,
     pub width: usize,
     pub height: usize,
@@ -14,8 +14,7 @@ pub struct Viewport {
 
 impl Viewport {
     pub fn end_bin(self) -> i64 {
-        ((self.position as f64 + self.samples * 0.5) * self.width as f64 / self.samples).floor()
-            as i64
+        ((self.position + self.samples * 0.5) * self.width as f64 / self.samples).floor() as i64
     }
 
     pub fn start(self) -> f64 {

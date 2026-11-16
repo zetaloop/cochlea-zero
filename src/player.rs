@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use gpui::component::{
     ActiveTheme, Disableable, Icon, Selectable, Sizable, Theme, TitleBar,
     button::{Button, ButtonGroup, ButtonVariants},
+    input::{InputEvent, InputState, NumberInput},
     slider::{Slider, SliderEvent, SliderScale, SliderState},
 };
 use gpui::{
@@ -20,7 +21,7 @@ actions!(cochlea, [Open, TogglePlayback]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("space", TogglePlayback, Some("Player")),
+        KeyBinding::new("space", TogglePlayback, Some("Player && !Input")),
         KeyBinding::new(
             if cfg!(target_os = "macos") {
                 "cmd-o"
@@ -40,6 +41,8 @@ pub struct Player {
     seek: Entity<SliderState>,
     volume: Entity<SliderState>,
     span: Entity<SliderState>,
+    span_input: Entity<InputState>,
+    delay: Entity<InputState>,
     visual: Entity<Visual>,
     repeat: bool,
     seeking: bool,
@@ -53,15 +56,24 @@ impl Player {
         window.focus(&focus, cx);
         let seek = cx.new(|_| SliderState::new().max(1.0).step(0.0));
         let volume = cx.new(|_| SliderState::new().max(1.0).step(0.01).default_value(1.0));
-        let span = cx.new(|_| {
+        let visual = cx.new(|_| Visual::new());
+        let span = cx.new(|cx| {
             SliderState::new()
                 .min(2.0)
                 .max(500.0)
                 .step(0.1)
                 .scale(SliderScale::Logarithmic)
-                .default_value(96.0)
+                .default_value(visual.read(cx).span as f32)
         });
-        let visual = cx.new(|_| Visual::new());
+        let span_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(visual.read(cx).span.to_string())
+                .step(0.1)
+                .min(f64::from(span.read(cx).min_value()))
+                .max(f64::from(span.read(cx).max_value()))
+        });
+        let delay = cx
+            .new(|cx| InputState::new(window, cx).default_value(visual.read(cx).delay.to_string()));
         cx.subscribe_in(&seek, window, |this, _, event, _, cx| {
             match event {
                 SliderEvent::Change(value) => {
@@ -81,15 +93,70 @@ impl Player {
             cx.notify();
         })
         .detach();
-        cx.subscribe(&span, |this, _, event, cx| {
+        cx.subscribe_in(&span, window, |this, _, event, window, cx| {
             if let SliderEvent::Change(value) = event {
+                let value = (f64::from(value.end()) * 10.0).round() / 10.0;
                 this.visual.update(cx, |visual, cx| {
-                    visual.span = f64::from(value.end());
+                    visual.span = value;
                     cx.notify();
+                });
+                this.span_input.update(cx, |input, cx| {
+                    input.set_value(value.to_string(), window, cx);
                 });
                 cx.notify();
             }
         })
+        .detach();
+        cx.subscribe_in(
+            &span_input,
+            window,
+            |this, input, event, window, cx| match event {
+                InputEvent::Change => {
+                    let slider = this.span.read(cx);
+                    let range = f64::from(slider.min_value())..=f64::from(slider.max_value());
+                    if let Ok(value) = input.read(cx).value().parse::<f64>()
+                        && range.contains(&value)
+                    {
+                        this.span.update(cx, |slider, cx| {
+                            slider.set_value(value as f32, window, cx);
+                        });
+                        this.visual.update(cx, |visual, cx| {
+                            visual.span = value;
+                            cx.notify();
+                        });
+                    }
+                }
+                InputEvent::Blur => {
+                    let value = this.visual.read(cx).span.to_string();
+                    input.update(cx, |input, cx| input.set_value(value, window, cx));
+                }
+                InputEvent::PressEnter { .. } => window.focus(&this.focus, cx),
+                InputEvent::Focus => {}
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &delay,
+            window,
+            |this, input, event, window, cx| match event {
+                InputEvent::Change => {
+                    if let Ok(value) = input.read(cx).value().parse::<f64>()
+                        && value.is_finite()
+                    {
+                        this.visual.update(cx, |visual, cx| {
+                            visual.delay = value;
+                            cx.notify();
+                        });
+                    }
+                }
+                InputEvent::Blur => {
+                    let value = this.visual.read(cx).delay.to_string();
+                    input.update(cx, |input, cx| input.set_value(value, window, cx));
+                }
+                InputEvent::PressEnter { .. } => window.focus(&this.focus, cx),
+                InputEvent::Focus => {}
+            },
+        )
         .detach();
         cx.subscribe(&volume, |this, _, event, _| {
             if let SliderEvent::Change(value) = event
@@ -110,6 +177,8 @@ impl Player {
             seek,
             volume,
             span,
+            span_input,
+            delay,
             visual,
             repeat: false,
             seeking: false,
@@ -221,7 +290,7 @@ impl Render for Player {
         let name = track
             .map_or("Cochlea Zero", |track| track.name.as_str())
             .to_owned();
-        let time = track.map_or("0:00 / 0:00".to_owned(), |track| {
+        let time = track.map_or("00:00.000 / 00:00.000".to_owned(), |track| {
             format!(
                 "{} / {}",
                 time(self.position as f64 / f64::from(track.sample_rate)),
@@ -235,7 +304,6 @@ impl Render for Player {
         ];
         let mode = self.visual.read(cx).mode;
         let bands = self.visual.read(cx).bands;
-        let span = (self.span.read(cx).value().end() * 10.0).round() / 10.0;
         div()
             .id("player")
             .key_context("Player")
@@ -323,7 +391,34 @@ impl Render for Player {
                                     .flex_1()
                                     .child(Slider::new(&self.span).accessibility_label("时间跨度")),
                             )
-                            .child(div().w(px(68.0)).text_right().child(format!("{span} ms"))),
+                            .child(
+                                NumberInput::new(&self.span_input)
+                                    .small()
+                                    .w(px(104.0))
+                                    .flex_none()
+                                    .stepper(false)
+                                    .suffix("ms")
+                                    .accessibility_label("时间跨度"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("画面延迟"),
+                            )
+                            .child(
+                                NumberInput::new(&self.delay)
+                                    .small()
+                                    .w(px(144.0))
+                                    .flex_none()
+                                    .suffix("ms")
+                                    .accessibility_label("画面延迟"),
+                            ),
                     )
                     .child(
                         div()
@@ -414,7 +509,12 @@ impl Render for Player {
                                         cx.notify();
                                     })),
                             )
-                            .child(div().text_color(cx.theme().muted_foreground).child(time))
+                            .child(
+                                div()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(time),
+                            )
                             .child(div().flex_1())
                             .child(
                                 Icon::new(IconName::Volume2)
@@ -432,6 +532,11 @@ impl Render for Player {
 }
 
 fn time(seconds: f64) -> String {
-    let seconds = seconds as u64;
-    format!("{}:{:02}", seconds / 60, seconds % 60)
+    let milliseconds = (seconds * 1000.0).round() as u64;
+    format!(
+        "{:02}:{:02}.{:03}",
+        milliseconds / 60_000,
+        milliseconds / 1000 % 60,
+        milliseconds % 1000,
+    )
 }
