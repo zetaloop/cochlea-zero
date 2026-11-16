@@ -33,6 +33,9 @@ fn main() {
                     cx,
                 ))),
                 window_min_size: Some(size(px(760.0), px(480.0))),
+                inactive_frame_interval: None,
+                low_power_frame_interval: None,
+                thermal_frame_interval: None,
                 ..TitleBar::window_options()
             };
             gpui::open_window(options, cx, |window, cx| {
