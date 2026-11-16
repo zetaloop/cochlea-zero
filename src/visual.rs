@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::Arc,
+};
 
 use gpui::{
     Bounds, Context, Hsla, IntoElement, PathBuilder, Pixels, Render, RenderImage, Window,
@@ -23,10 +26,31 @@ pub enum ViewMode {
     Combined,
 }
 
+const TILE_WIDTH: i64 = 256 - 2;
+
+#[derive(PartialEq)]
+struct Format {
+    width: usize,
+    height: usize,
+    samples: f64,
+    colors: [[u8; 3]; 2],
+}
+
 struct Signal {
     track: Arc<Track>,
     analyzer: Analyzer,
-    image: Option<Arc<RenderImage>>,
+    images: BTreeMap<i64, Arc<RenderImage>>,
+    format: Option<Format>,
+}
+
+impl Signal {
+    fn clear(&mut self, window: &mut Window) {
+        for image in std::mem::take(&mut self.images).into_values() {
+            window
+                .drop_image(image)
+                .expect("failed to release spectrum");
+        }
+    }
 }
 
 pub struct Visual {
@@ -49,18 +73,15 @@ impl Visual {
     }
 
     pub fn set_track(&mut self, track: Arc<Track>, window: &mut Window) {
-        if let Some(signal) = self.signal.take()
-            && let Some(image) = signal.image
-        {
-            window
-                .drop_image(image)
-                .expect("failed to release spectrum");
+        if let Some(signal) = &mut self.signal {
+            signal.clear(window);
         }
         self.position = 0;
         self.signal = Some(Signal {
             analyzer: Analyzer::new(track.sample_rate, self.bands),
             track,
-            image: None,
+            images: BTreeMap::new(),
+            format: None,
         });
     }
 
@@ -68,6 +89,7 @@ impl Visual {
         self.bands = bands;
         if let Some(signal) = &mut self.signal {
             signal.analyzer = Analyzer::new(signal.track.sample_rate, bands);
+            signal.format = None;
         }
     }
 
@@ -76,20 +98,47 @@ impl Visual {
         view: Viewport,
         colors: [[u8; 3]; 2],
         window: &mut Window,
-    ) -> Option<Arc<RenderImage>> {
-        let signal = self.signal.as_mut()?;
-        if let Some(pixels) = signal.analyzer.render(&signal.track, view, colors) {
-            let buffer =
-                RgbaImage::from_raw(view.width as u32, view.height as u32, pixels.to_vec())
-                    .expect("spectrum dimensions match buffer");
-            let image = Arc::new(RenderImage::new([Frame::new(buffer)]));
-            if let Some(previous) = signal.image.replace(image) {
-                window
-                    .drop_image(previous)
-                    .expect("failed to release spectrum");
+    ) -> Vec<(i64, Arc<RenderImage>)> {
+        let Some(signal) = &mut self.signal else {
+            return Vec::new();
+        };
+        let format = Format {
+            width: view.width,
+            height: view.height,
+            samples: view.samples,
+            colors,
+        };
+        if signal.format.as_ref() != Some(&format) {
+            signal.clear(window);
+            signal.format = Some(format);
+        }
+        let first = (view.end_bin() - view.width as i64).div_euclid(TILE_WIDTH);
+        let last = (view.end_bin() - 1).div_euclid(TILE_WIDTH);
+        let visible = first..=last;
+        for (_, image) in signal
+            .images
+            .extract_if(.., |tile, _| !visible.contains(tile))
+        {
+            window
+                .drop_image(image)
+                .expect("failed to release spectrum");
+        }
+        for tile in visible {
+            if let Entry::Vacant(slot) = signal.images.entry(tile) {
+                // Adjacent columns keep texture filtering continuous across tile edges.
+                let columns = tile * TILE_WIDTH - 1..(tile + 1) * TILE_WIDTH + 1;
+                let pixels = signal.analyzer.render(&signal.track, view, columns, colors);
+                let buffer =
+                    RgbaImage::from_raw((TILE_WIDTH + 2) as u32, view.height as u32, pixels)
+                        .expect("spectrum dimensions match buffer");
+                slot.insert(Arc::new(RenderImage::new([Frame::new(buffer)])));
             }
         }
-        signal.image.clone()
+        signal
+            .images
+            .iter()
+            .map(|(&tile, image)| (tile, image.clone()))
+            .collect()
     }
 }
 
@@ -145,18 +194,30 @@ impl Render for Visual {
                     panel().child(
                         canvas(
                             move |bounds, window, cx| {
-                                let view = viewport(position, samples, bounds, window);
-                                let image = spectrum.update(cx, |spectrum, _| {
+                                let (bounds, view) = viewport(position, samples, bounds, window);
+                                let images = spectrum.update(cx, |spectrum, _| {
                                     spectrum.spectrum(view, colors, window)
                                 });
-                                (view, image)
+                                (bounds, view, images)
                             },
-                            move |bounds, (view, image), window, _| {
-                                if let Some(image) = image {
+                            move |_, (bounds, view, images), window, _| {
+                                let pixel = bounds.size.width / view.width as f32;
+                                let first = view.end_bin() - view.width as i64;
+                                for (tile, image) in images {
+                                    let left =
+                                        bounds.left() + pixel * (tile * TILE_WIDTH - first) as f32;
+                                    let core = Bounds::new(
+                                        point(left, bounds.top()),
+                                        size(pixel * TILE_WIDTH as f32, bounds.size.height),
+                                    );
+                                    let image_bounds = Bounds::new(
+                                        point(left - pixel, bounds.top()),
+                                        size(pixel * (TILE_WIDTH + 2) as f32, bounds.size.height),
+                                    );
                                     window
                                         .paint_image(
-                                            bounds,
-                                            bounds,
+                                            core.intersect(&bounds),
+                                            image_bounds,
                                             Default::default(),
                                             image,
                                             0,
@@ -176,7 +237,7 @@ impl Render for Visual {
                     panel().child(
                         canvas(
                             move |bounds, window, _| viewport(position, samples, bounds, window),
-                            move |bounds, view, window, _| {
+                            move |_, (bounds, view), window, _| {
                                 waveform(&track, view, bounds, ink, window);
                                 playhead(view, bounds, ink, window);
                             },
@@ -189,14 +250,24 @@ impl Render for Visual {
     }
 }
 
-fn viewport(position: usize, samples: f64, bounds: Bounds<Pixels>, window: &Window) -> Viewport {
+fn viewport(
+    position: usize,
+    samples: f64,
+    bounds: Bounds<Pixels>,
+    window: &Window,
+) -> (Bounds<Pixels>, Viewport) {
+    let bounds = Bounds::from_corners(
+        window.pixel_snap_point(bounds.origin),
+        window.pixel_snap_point(bounds.bottom_right()),
+    );
     let scale = window.scale_factor();
-    Viewport {
+    let view = Viewport {
         position,
         samples,
         width: (f32::from(bounds.size.width) * scale).round().max(1.0) as usize,
         height: (f32::from(bounds.size.height) * scale).round().max(1.0) as usize,
-    }
+    };
+    (bounds, view)
 }
 
 fn playhead(view: Viewport, bounds: Bounds<Pixels>, ink: Hsla, window: &mut Window) {

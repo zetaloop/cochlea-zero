@@ -1,4 +1,4 @@
-use std::f64::consts::TAU;
+use std::{f64::consts::TAU, ops::Range};
 
 use rayon::prelude::*;
 
@@ -75,12 +75,7 @@ pub struct Analyzer {
     start: usize,
     end: usize,
     capacity: usize,
-    width: usize,
-    height: usize,
-    samples: f64,
-    end_bin: Option<i64>,
     levels: Vec<f32>,
-    pixels: Vec<u8>,
     colors: Option<[[u8; 3]; 2]>,
     palette: Vec<[u8; 4]>,
 }
@@ -94,33 +89,22 @@ impl Analyzer {
             start: 0,
             end: 0,
             capacity: 0,
-            width: 0,
-            height: 0,
-            samples: 0.0,
-            end_bin: None,
             levels: Vec::new(),
-            pixels: Vec::new(),
             colors: None,
             palette: Vec::new(),
         }
     }
 
-    pub fn render(&mut self, track: &Track, view: Viewport, colors: [[u8; 3]; 2]) -> Option<&[u8]> {
-        let resized =
-            self.width != view.width || self.height != view.height || self.samples != view.samples;
-        let recolor = self.colors != Some(colors);
-        let end_bin = view.end_bin();
-        let shift = self.end_bin.map(|previous| end_bin - previous);
-        if !resized && !recolor && shift == Some(0) {
-            return None;
-        }
-        let first_column = match shift {
-            Some(shift) if !resized && !recolor && (0..view.width as i64).contains(&shift) => {
-                view.width - shift as usize
-            }
-            _ => 0,
-        };
-        if recolor {
+    pub fn render(
+        &mut self,
+        track: &Track,
+        view: Viewport,
+        columns: Range<i64>,
+        colors: [[u8; 3]; 2],
+    ) -> Vec<u8> {
+        let width = (columns.end - columns.start) as usize;
+        let offset = (columns.start - view.end_bin() + view.width as i64) as f64;
+        if self.colors != Some(colors) {
             self.palette = (0..4096)
                 .map(|index| {
                     let light = (1.0 - (-f64::from(index) / 384.0).exp()).powf(0.64);
@@ -135,16 +119,12 @@ impl Analyzer {
                 .collect();
             self.colors = Some(colors);
         }
-        self.width = view.width;
-        self.height = view.height;
-        self.samples = view.samples;
-        self.levels.resize(view.width * self.bands.len(), 0.0);
-        self.pixels.resize(view.width * view.height * 4, 0);
+        self.levels.resize(width * self.bands.len(), 0.0);
 
-        let start = view.start().floor().max(0.0) as usize;
-        let end =
-            (view.sample_at(view.width as f64).ceil().max(0.0) as usize + 1).min(track.frames());
-        let capacity = view.samples.ceil() as usize + 4;
+        let start = view.sample_at(offset).floor().max(0.0) as usize;
+        let end = (view.sample_at(offset + width as f64).ceil().max(0.0) as usize + 1)
+            .min(track.frames());
+        let capacity = (width as f64 * view.samples / view.width as f64).ceil() as usize + 4;
         let reset = self.capacity != capacity
             || start < self.start
             || start.saturating_sub(self.end) > self.bands[0].warmup;
@@ -178,21 +158,19 @@ impl Analyzer {
         let step = view.samples / view.width as f64;
         self.bands
             .par_iter()
-            .zip(self.levels.par_chunks_exact_mut(view.width))
+            .zip(self.levels.par_chunks_exact_mut(width))
             .for_each(|(band, levels)| {
-                if first_column > 0 {
-                    levels.copy_within(view.width - first_column.., 0);
-                }
-                for (x, level) in levels.iter_mut().enumerate().skip(first_column) {
+                for (x, level) in levels.iter_mut().enumerate() {
                     if step >= 1.0 {
-                        let from = view.sample_at(x as f64).floor().max(0.0) as usize;
-                        let to = (view.sample_at((x + 1) as f64).floor().max(0.0) as usize)
+                        let from = view.sample_at(offset + x as f64).floor().max(0.0) as usize;
+                        let to = (view.sample_at(offset + (x + 1) as f64).floor().max(0.0)
+                            as usize)
                             .min(track.frames());
                         *level = (from..to)
                             .map(|frame| strength(band.history[frame % capacity]))
                             .fold(0.0, f32::max);
                     } else {
-                        let index = view.sample_at(x as f64 + 0.5);
+                        let index = view.sample_at(offset + x as f64 + 0.5);
                         let frame = index.floor() as i64;
                         let fraction = (index - frame as f64) as f32;
                         let a = band.sample(frame, track.frames());
@@ -201,33 +179,24 @@ impl Analyzer {
                     }
                 }
             });
-        self.pixels
-            .par_chunks_exact_mut(view.width * 4)
+        let mut pixels = vec![0; width * view.height * 4];
+        pixels
+            .par_chunks_exact_mut(width * 4)
             .enumerate()
             .for_each(|(y, row)| {
-                if first_column > 0 {
-                    row.copy_within((view.width - first_column) * 4.., 0);
-                }
                 let position = (1.0 - y as f64 / (view.height - 1).max(1) as f64)
                     * (self.bands.len() - 1) as f64;
                 let lower = (position.floor() as usize).min(self.bands.len() - 2);
                 let fraction = (position - lower as f64) as f32;
                 let gain = (12.5 * (1.0 + position / self.bands.len() as f64 * 2.3) * 384.0) as f32;
-                let a = &self.levels[lower * view.width..];
-                let b = &self.levels[(lower + 1) * view.width..];
-                for (x, pixel) in row
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .enumerate()
-                    .skip(first_column)
-                {
+                let a = &self.levels[lower * width..];
+                let b = &self.levels[(lower + 1) * width..];
+                for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let level = a[x] * (1.0 - fraction) + b[x] * fraction;
                     *pixel = self.palette[((level * gain) as usize).min(4095)];
                 }
             });
-        self.end_bin = Some(end_bin);
-        Some(&self.pixels)
+        pixels
     }
 }
 
