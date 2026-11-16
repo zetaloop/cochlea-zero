@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod analysis;
 mod audio;
 mod playback;
 mod player;
+mod visual;
 
 use gpui::{
     AppContext, Bounds, WindowBounds, WindowOptions,

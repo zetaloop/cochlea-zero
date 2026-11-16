@@ -1,16 +1,20 @@
 use std::{path::PathBuf, sync::Arc};
 
 use gpui::component::{
-    ActiveTheme, Disableable, Icon, Selectable, Sizable, StyledExt, Theme, TitleBar,
-    button::{Button, ButtonVariants},
-    slider::{Slider, SliderEvent, SliderState},
+    ActiveTheme, Disableable, Icon, Selectable, Sizable, Theme, TitleBar,
+    button::{Button, ButtonGroup, ButtonVariants},
+    slider::{Slider, SliderEvent, SliderScale, SliderState},
 };
 use gpui::{
     App, Context, Entity, ExternalPaths, FocusHandle, KeyBinding, PathPromptOptions, Render, Task,
     Window, actions, assets::IconName, div, prelude::*, px,
 };
 
-use crate::{audio::Track, playback::Playback};
+use crate::{
+    audio::Track,
+    playback::Playback,
+    visual::{ViewMode, Visual},
+};
 
 actions!(cochlea, [Open, TogglePlayback]);
 
@@ -35,6 +39,8 @@ pub struct Player {
     loading: Option<Task<()>>,
     seek: Entity<SliderState>,
     volume: Entity<SliderState>,
+    span: Entity<SliderState>,
+    visual: Entity<Visual>,
     repeat: bool,
     seeking: bool,
     position: usize,
@@ -47,6 +53,15 @@ impl Player {
         window.focus(&focus, cx);
         let seek = cx.new(|_| SliderState::new().max(1.0).step(0.0));
         let volume = cx.new(|_| SliderState::new().max(1.0).step(0.01).default_value(1.0));
+        let span = cx.new(|_| {
+            SliderState::new()
+                .min(2.0)
+                .max(500.0)
+                .step(0.1)
+                .scale(SliderScale::Logarithmic)
+                .default_value(96.0)
+        });
+        let visual = cx.new(|_| Visual::new());
         cx.subscribe_in(&seek, window, |this, _, event, _, cx| {
             match event {
                 SliderEvent::Change(value) => {
@@ -55,11 +70,25 @@ impl Player {
                         this.position = (f64::from(value.end()) * playback.track.frames() as f64)
                             .round() as usize;
                         playback.seek(this.position);
+                        this.visual.update(cx, |visual, cx| {
+                            visual.position = this.position;
+                            cx.notify();
+                        });
                     }
                 }
                 SliderEvent::Release(_) => this.seeking = false,
             }
             cx.notify();
+        })
+        .detach();
+        cx.subscribe(&span, |this, _, event, cx| {
+            if let SliderEvent::Change(value) = event {
+                this.visual.update(cx, |visual, cx| {
+                    visual.span = f64::from(value.end());
+                    cx.notify();
+                });
+                cx.notify();
+            }
         })
         .detach();
         cx.subscribe(&volume, |this, _, event, _| {
@@ -80,6 +109,8 @@ impl Player {
             loading: None,
             seek,
             volume,
+            span,
+            visual,
             repeat: false,
             seeking: false,
             position: 0,
@@ -128,6 +159,10 @@ impl Player {
                     Ok(mut playback) => {
                         playback.set_volume(this.volume.read(cx).value().end());
                         playback.set_repeat(this.repeat);
+                        this.visual.update(cx, |visual, cx| {
+                            visual.set_track(playback.track.clone(), window);
+                            cx.notify();
+                        });
                         this.playback = Some(playback);
                         if let Some(playback) = &mut this.playback {
                             playback.toggle();
@@ -160,6 +195,10 @@ impl Player {
                     let value = position as f32 / playback.track.frames() as f32;
                     self.seek
                         .update(cx, |seek, cx| seek.set_value(value, window, cx));
+                    self.visual.update(cx, |visual, cx| {
+                        visual.position = position;
+                        cx.notify();
+                    });
                 }
                 Err(error) => self.error = Some(format!("{error:#}")),
                 _ => {}
@@ -189,8 +228,14 @@ impl Render for Player {
                 time(track.duration())
             )
         });
-        let details =
-            track.map(|track| format!("{} Hz  /  {} 声道", track.sample_rate, track.channels));
+        let modes = [
+            (ViewMode::Spectrum, "频谱"),
+            (ViewMode::Waveform, "波形"),
+            (ViewMode::Combined, "上下排列"),
+        ];
+        let mode = self.visual.read(cx).mode;
+        let bands = self.visual.read(cx).bands;
+        let span = (self.span.read(cx).value().end() * 10.0).round() / 10.0;
         div()
             .id("player")
             .key_context("Player")
@@ -235,26 +280,84 @@ impl Render for Player {
                                 this.open(&Open, window, cx);
                             })),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(name.clone())),
+                    .child(div().flex_1().min_w_0().truncate().child(name)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_4()
+                    .px_5()
+                    .pt_4()
+                    .child(
+                        ButtonGroup::new("view")
+                            .small()
+                            .children(modes.map(|(value, label)| {
+                                Button::new(label).label(label).selected(mode == value)
+                            }))
+                            .on_click(cx.listener(move |this, indices: &Vec<usize>, _, cx| {
+                                if let Some(&index) = indices.first() {
+                                    this.visual.update(cx, |visual, cx| {
+                                        visual.mode = modes[index].0;
+                                        cx.notify();
+                                    });
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w(px(240.0))
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("时间跨度"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Slider::new(&self.span).accessibility_label("时间跨度")),
+                            )
+                            .child(div().w(px(68.0)).text_right().child(format!("{span} ms"))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_color(cx.theme().muted_foreground).child("频段"))
+                            .child(
+                                ButtonGroup::new("bands")
+                                    .small()
+                                    .children([128, 256, 512].map(|value| {
+                                        Button::new(("bands", value))
+                                            .label(value.to_string())
+                                            .selected(bands == value)
+                                    }))
+                                    .on_click(cx.listener(|this, indices: &Vec<usize>, _, cx| {
+                                        if let Some(&index) = indices.first() {
+                                            this.visual.update(cx, |visual, cx| {
+                                                visual.set_bands([128, 256, 512][index]);
+                                                cx.notify();
+                                            });
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_4()
-                    .px_8()
-                    .child(
-                        Icon::new(IconName::AudioLines)
-                            .size(px(48.0))
-                            .text_color(cx.theme().primary),
-                    )
-                    .child(div().text_xl().font_semibold().child(name))
-                    .when_some(details, |this, details| {
-                        this.child(div().text_color(cx.theme().muted_foreground).child(details))
-                    }),
+                    .min_h_0()
+                    .px_5()
+                    .py_4()
+                    .child(self.visual.clone()),
             )
             .when_some(self.error.clone(), |this, error| {
                 this.child(

@@ -858,6 +858,8 @@ dependencies = [
  "anyhow",
  "cpal",
  "gpui-kit",
+ "image",
+ "rayon",
  "serde_json",
  "triple_buffer",
 ]

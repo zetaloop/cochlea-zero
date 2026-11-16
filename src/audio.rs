@@ -54,13 +54,17 @@ impl Track {
             !decoded.stdout.is_empty() && decoded.stdout.len().is_multiple_of(4 * channels),
             "解码后的音频数据不完整"
         );
-        let samples = decoded
+        let samples: Vec<f32> = decoded
             .stdout
             .as_chunks::<4>()
             .0
             .iter()
             .map(|&bytes| f32::from_le_bytes(bytes))
             .collect();
+        ensure!(
+            samples.iter().all(|value| value.is_finite()),
+            "音频包含无效采样值"
+        );
         Ok(Self {
             name: path
                 .file_stem()
@@ -79,6 +83,14 @@ impl Track {
 
     pub fn duration(&self) -> f64 {
         self.frames() as f64 / f64::from(self.sample_rate)
+    }
+
+    pub fn sample(&self, frame: usize) -> f32 {
+        let sum = self.samples[frame * self.channels..(frame + 1) * self.channels]
+            .iter()
+            .map(|&value| f64::from(value))
+            .sum::<f64>();
+        (sum / self.channels as f64) as f32
     }
 }
 
