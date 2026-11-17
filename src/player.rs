@@ -429,7 +429,7 @@ impl Render for Player {
                             .child(
                                 ButtonGroup::new("bands")
                                     .small()
-                                    .children([128, 256, 512].map(|value| {
+                                    .children([128, 256, 512, 1024].map(|value| {
                                         Button::new(("bands", value))
                                             .label(value.to_string())
                                             .selected(bands == value)
@@ -437,7 +437,7 @@ impl Render for Player {
                                     .on_click(cx.listener(|this, indices: &Vec<usize>, _, cx| {
                                         if let Some(&index) = indices.first() {
                                             this.visual.update(cx, |visual, cx| {
-                                                visual.set_bands([128, 256, 512][index]);
+                                                visual.set_bands([128, 256, 512, 1024][index]);
                                                 cx.notify();
                                             });
                                             cx.notify();
