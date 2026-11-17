@@ -4,7 +4,8 @@ use std::{
 };
 
 use gpui::{
-    Bounds, Context, Hsla, IntoElement, PathBuilder, Pixels, Render, RenderImage, Window,
+    AnyElement, Bounds, Context, Hsla, IntoElement, PathBuilder, Pixels, Render, RenderImage,
+    Window,
     assets::IconName,
     canvas,
     component::{ActiveTheme, Icon},
@@ -145,7 +146,7 @@ impl Visual {
 }
 
 impl Render for Visual {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(signal) = &self.signal else {
             return div()
                 .size_full()
@@ -175,16 +176,54 @@ impl Render for Visual {
         let position = (self.position as f64 - f64::from(track.sample_rate) * self.delay / 1000.0)
             .clamp(-samples, track.frames() as f64 + samples);
         let spectrum = cx.entity();
-        let panel = || {
+        let radius = window.rem_size() * 0.5;
+        let border = window.pixel_snap(px(1.0));
+        let panel = |content: AnyElement| {
             div()
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
-                .rounded_lg()
+                .rounded(radius)
                 .overflow_hidden()
-                .border_1()
+                .border(border)
                 .border_color(cx.theme().border)
                 .bg(background)
+                .child(content)
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            let pixel = px(1.0 / window.scale_factor());
+                            let radius = radius
+                                .min(bounds.size.width * 0.5)
+                                .min(bounds.size.height * 0.5)
+                                / pixel;
+                            // Split pixels at the stroke center; the border supplies antialiasing.
+                            let edge = radius - border / pixel * 0.5;
+                            for row in 0..radius.ceil() as usize {
+                                let dy = radius - row as f32 - 0.5;
+                                let width = pixel
+                                    * (radius - (edge * edge - dy * dy).max(0.0).sqrt() - 0.5)
+                                        .ceil()
+                                        .max(0.0);
+                                let y = pixel * row as f32;
+                                for origin in [
+                                    point(bounds.left(), bounds.top() + y),
+                                    point(bounds.right() - width, bounds.top() + y),
+                                    point(bounds.left(), bounds.bottom() - y - pixel),
+                                    point(bounds.right() - width, bounds.bottom() - y - pixel),
+                                ] {
+                                    window.paint_quad(fill(
+                                        Bounds::new(origin, size(width, pixel)),
+                                        background,
+                                    ));
+                                }
+                            }
+                        },
+                    )
+                    .absolute()
+                    .inset(-border),
+                )
         };
         div()
             .size_full()
@@ -193,61 +232,58 @@ impl Render for Visual {
             .flex_col()
             .gap_3()
             .when(self.mode != ViewMode::Waveform, |this| {
-                this.child(
-                    panel().child(
-                        canvas(
-                            move |bounds, window, cx| {
-                                let (bounds, view) = viewport(position, samples, bounds, window);
-                                let images = spectrum.update(cx, |spectrum, _| {
-                                    spectrum.spectrum(view, colors, window)
-                                });
-                                (bounds, view, images)
-                            },
-                            move |_, (bounds, view, images), window, _| {
-                                let pixel = bounds.size.width / view.width as f32;
-                                let first = view.end_bin() - view.width as i64;
-                                for (tile, image) in images {
-                                    let left =
-                                        bounds.left() + pixel * (tile * TILE_WIDTH - first) as f32;
-                                    let core = Bounds::new(
-                                        point(left, bounds.top()),
-                                        size(pixel * TILE_WIDTH as f32, bounds.size.height),
-                                    );
-                                    let image_bounds = Bounds::new(
-                                        point(left - pixel, bounds.top()),
-                                        size(pixel * (TILE_WIDTH + 2) as f32, bounds.size.height),
-                                    );
-                                    window
-                                        .paint_image(
-                                            core.intersect(&bounds),
-                                            image_bounds,
-                                            Default::default(),
-                                            image,
-                                            0,
-                                            false,
-                                        )
-                                        .expect("failed to paint spectrum");
-                                }
-                                playhead(view, bounds, ink, window);
-                            },
-                        )
-                        .size_full(),
-                    ),
-                )
+                this.child(panel(
+                    canvas(
+                        move |bounds, window, cx| {
+                            let (bounds, view) = viewport(position, samples, bounds, window);
+                            let images = spectrum
+                                .update(cx, |spectrum, _| spectrum.spectrum(view, colors, window));
+                            (bounds, view, images)
+                        },
+                        move |_, (bounds, view, images), window, _| {
+                            let pixel = bounds.size.width / view.width as f32;
+                            let first = view.end_bin() - view.width as i64;
+                            for (tile, image) in images {
+                                let left =
+                                    bounds.left() + pixel * (tile * TILE_WIDTH - first) as f32;
+                                let core = Bounds::new(
+                                    point(left, bounds.top()),
+                                    size(pixel * TILE_WIDTH as f32, bounds.size.height),
+                                );
+                                let image_bounds = Bounds::new(
+                                    point(left - pixel, bounds.top()),
+                                    size(pixel * (TILE_WIDTH + 2) as f32, bounds.size.height),
+                                );
+                                window
+                                    .paint_image(
+                                        core.intersect(&bounds),
+                                        image_bounds,
+                                        Default::default(),
+                                        image,
+                                        0,
+                                        false,
+                                    )
+                                    .expect("failed to paint spectrum");
+                            }
+                            playhead(view, bounds, ink, window);
+                        },
+                    )
+                    .size_full()
+                    .into_any_element(),
+                ))
             })
             .when(self.mode != ViewMode::Spectrum, |this| {
-                this.child(
-                    panel().child(
-                        canvas(
-                            move |bounds, window, _| viewport(position, samples, bounds, window),
-                            move |_, (bounds, view), window, _| {
-                                waveform(&track, view, bounds, ink, window);
-                                playhead(view, bounds, ink, window);
-                            },
-                        )
-                        .size_full(),
-                    ),
-                )
+                this.child(panel(
+                    canvas(
+                        move |bounds, window, _| viewport(position, samples, bounds, window),
+                        move |_, (bounds, view), window, _| {
+                            waveform(&track, view, bounds, ink, window);
+                            playhead(view, bounds, ink, window);
+                        },
+                    )
+                    .size_full()
+                    .into_any_element(),
+                ))
             })
             .into_any_element()
     }
