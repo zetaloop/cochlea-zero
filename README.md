@@ -1,21 +1,15 @@
 # Cochlea Zero
 
-基于 GPUI 的音频播放器，提供频谱纹理、波形及上下排列视图，支持时间跨度和频段数量调节。
+基于 GPUI 的本地音频播放器，可以实时显示频谱纹理与波形。
 
-## 运行
+## 使用
 
-需要 Rust，以及位于 PATH 中的 `ffmpeg` 和 `ffprobe`。
+运行需要 FFmpeg，`ffmpeg` 和 `ffprobe` 均需位于 PATH 中。
 
-```sh
-cargo run --release
-```
+打开或拖入音频文件即可播放。
 
-打开或拖入音频文件即可播放。空格切换播放和暂停，`Ctrl+O` 打开文件；macOS 对应 `Cmd+O`。
-
-## 构建
+## 从源码构建
 
 ```sh
 cargo build --release
 ```
-
-生成的程序位于 `target/release/`。
