@@ -85,9 +85,11 @@ impl Playback {
                             {
                                 *output = sample * controls.volume;
                             }
-                            cursor += 1;
                         } else {
                             output.fill(0.0);
+                        }
+                        if controls.playing {
+                            cursor += 1;
                         }
                     }
                     clock_input.write(Clock {
